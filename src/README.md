@@ -1,1 +1,1 @@
-.cpp files go here
+.cpp files go here (should be empty if we want to keep it header only)
