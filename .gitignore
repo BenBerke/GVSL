@@ -1,0 +1,19 @@
+# Build output
+cmake-build-*/
+build/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.user
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
