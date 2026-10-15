@@ -7,8 +7,10 @@
 
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <ranges>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -21,12 +23,6 @@ namespace GVSL {
     //=======================================
     // Constants
     //=======================================
-
-    template <typename T, typename U>
-    auto Add(T a, U b) { return a + b; }
-
-    template <typename T, typename U>
-    auto Subtract(T a, U b) { return a - b; }
 
     // -------
     // Nodes
@@ -117,6 +113,8 @@ namespace GVSL {
         PinID id = INVALID_ID;
         NodeID nodeID = INVALID_ID; // Denormalization but will offer speed-boost
 
+        std::vector<PinID> nextPinIDs;
+
         PinDirection direction = PinDirection::INPUT;
 
         Value value;
@@ -141,17 +139,17 @@ namespace GVSL {
     };
 
     struct FlattenedNode {
-        NodeID originalNodeID = INVALID_ID; // May not be necessary
         NodeType type = NodeType::UNKNOWN;
 
-
         std::vector<Value> inputValues;
-        std::vector<Value> outputValues; // Will be filled by FlattenNode()
     };
 
     struct Graph {
         std::unordered_map<NodeID, Node> nodes;
         std::unordered_map<PinID, Pin> pins;
+
+        // first -> second
+        void ConnectPin(const PinID first, const PinID second) { pins[first].nextPinIDs.push_back(second);}
     };
 
     class Compiler {
@@ -166,55 +164,113 @@ namespace GVSL {
 
         Graph currentGraph;
 
+        std::vector<NodeID> evaluationOrder; // nodes in the order they were evaluated
+
         void CreateError(const std::string_view error) {
             success = false;
             errorMessage = error;
         }
 
-        // Take a node, strip away the unnecesary information and emit a flattened version for the IR
-        [[nodiscard]] FlattenedNode FlattenNode(const Node& node) {
-            FlattenedNode output;
-            output.originalNodeID = node.id;
-            output.type = node.type;
+        // Compute one node's outputs from its inputs and push them to connected pins
+        bool EvaluateNode(const Node& node) {
+            std::vector<Value> inputValues(node.inputPinIDs.size());
+            for (size_t i = 0; i < node.inputPinIDs.size(); i++) inputValues[i] = currentGraph.pins[node.inputPinIDs[i]].value;
 
-            // Fill in the flattened node's inputs from the original node, the outputs will be created
-            // THIS IS COMPLETELY WRONG, THIS HAS TO GO
-            output.inputValues.resize(node.inputPinIDs.size());
-            for (size_t i = 0; i < node.inputPinIDs.size(); i++) output.inputValues[i] = currentGraph.pins[node.inputPinIDs[i]].value;
+            std::vector<Value> outputValues(node.outputPinIDs.size());
 
-            //todo IMPORTANT FILL IN THE FOLLOWING NODE'S INPUTS I AM SICK RIGHT NOW I HAVE TO GO
-
-            auto IsMathOperation = [node, output]() -> bool {
-                return node.CheckPinCounts(2, 1) && IsNumber(output.inputValues[0].data) && IsNumber(output.inputValues[1].data);
+            auto IsMathOperationNode = [&]() -> bool {
+                return node.CheckPinCounts(2, 1) && IsNumber(inputValues[0].data) && IsNumber(inputValues[1].data);
             };
 
             switch (node.type) {
                 case NodeType::ADD:
-                    if (!IsMathOperation()) CreateError("Invalid Pin Count in Node: ADD");
-                    output.outputValues[0] = output.inputValues[0] + output.inputValues[1];
-                    break;
-
                 case NodeType::SUB:
-                    if (!IsMathOperation()) CreateError("Invalid Pin Count in Node: SUB");
-                    output.outputValues[0] = output.inputValues[0] - output.inputValues[1];
-                    break;
-
                 case NodeType::MUL:
-                    if (!IsMathOperation()) CreateError("Invalid Pin Count in Node: MUL");
-                    output.outputValues[0] = output.inputValues[0] * output.inputValues[1];
-                    break;
+                case NodeType::DIV: {
+                    // Check the pin counts first so we never index past the end of inputValues
+                    if (!node.CheckPinCounts(2, 1)) { CreateError("Invalid Pin Count in math Node"); return false; }
+                    if (!IsMathOperationNode())     { CreateError("Non-number input in math Node");  return false; }
 
-                case NodeType::DIV:
-                    if (!IsMathOperation()) CreateError("Invalid Pin Count in Node: DIV");
-                    output.outputValues[0] = output.inputValues[0] / output.inputValues[1];
-                    break;
+                    const Value& a = inputValues[0];
+                    const Value& b = inputValues[1];
 
-                case NodeType::TYPE_COUNT:
-                default:
-                    success = false;
-                    errorMessage += "UNKNOWN NODE TYPE";
+                    // Integer division by zero is undefined behaviour, floats just give inf
+                    if (node.type == NodeType::DIV && IsType<int>(b.data) && std::get<int>(b.data) == 0) {
+                        CreateError("Integer division by zero");
+                        return false;
+                    }
+
+                    switch (node.type) {
+                        case NodeType::ADD: outputValues[0] = a + b; break;
+                        case NodeType::SUB: outputValues[0] = a - b; break;
+                        case NodeType::MUL: outputValues[0] = a * b; break;
+                        default:            outputValues[0] = a / b; break;
+                    }
                     break;
+                }
+
+                case NodeType::FUNC_START: break; // Entry point, nothing to compute
+
+                case NodeType::CUSTOM:  CreateError("CUSTOM nodes are not implemented yet"); return false;
+                case NodeType::UNKNOWN:
+                default:                CreateError("Unknown Node Type"); return false;
             }
+
+            // Store the results on the output pins, then forward them to every connected input pin
+            for (size_t i = 0; i < node.outputPinIDs.size(); i++) {
+                Pin& outputPin = currentGraph.pins[node.outputPinIDs[i]];
+                outputPin.value = outputValues[i];
+                for (PinID p : outputPin.nextPinIDs) currentGraph.pins[p].value = outputPin.value;
+            }
+
+            return true;
+        }
+
+        // Go through every single node, calculate the output pins and populate the following node's inputs
+        void PopulatePins() {
+            evaluationOrder.clear();
+
+            // Which nodes feed which inputs
+            std::unordered_map<PinID, NodeID> sourceOf;
+            for (const auto &pin: currentGraph.pins | std::views::values)
+                for (PinID next : pin.nextPinIDs) sourceOf[next] = pin.nodeID;
+
+            enum class State { UNVISITED, VISITING, DONE};
+            std::unordered_map<NodeID, State> state;
+
+            std::function<bool(NodeID)> Visit = [&](const NodeID id) -> bool {
+                State& s = state[id];
+                if (s == State::DONE) return true;
+                if (s == State::VISITING) { CreateError("Cycle detected in graph"); return false; }
+                s = State::VISITING;
+
+                const auto nodeIt = currentGraph.nodes.find(id);
+                if (nodeIt == currentGraph.nodes.end()) { CreateError("Pin refers to missing Node"); return false; }
+
+                const Node& node = nodeIt->second;
+
+                // Evaluate everything feeding this node first
+                for (PinID in : node.inputPinIDs)
+                    if (auto it = sourceOf.find(in); it != sourceOf.end() && !Visit(it->second)) return false;
+
+                if (!EvaluateNode(node)) return false;
+
+                s = State::DONE;
+                evaluationOrder.push_back(id);
+                return true;
+            };
+
+            for (const auto &id: currentGraph.nodes | std::views::keys) if (!Visit(id)) return;
+        }
+
+        // Take a node, strip away the unnecessary information and emit a flattened version for the IR
+        [[nodiscard]] FlattenedNode FlattenNode(const Node& node) {
+            FlattenedNode output;
+            output.type = node.type;
+
+            // Fill in the flattened node's inputs from the original node, the outputs will be created
+            output.inputValues.resize(node.inputPinIDs.size());
+            for (size_t i = 0; i < node.inputPinIDs.size(); i++) output.inputValues[i] = currentGraph.pins[node.inputPinIDs[i]].value;
 
             return output;
         }
@@ -230,7 +286,7 @@ namespace GVSL {
 
             auto TurnToString = [node, EmitBinaryOperation, this]() -> std::string {
                 switch (node.type) {
-                    case NodeType::ADD: return EmitBinaryOperation('+');
+                    case NodeType::ADD: return EmitBinaryOperation('+'); // for example this will emit "a + b", this is just a test example
                     case NodeType::SUB: return EmitBinaryOperation('-');
                     case NodeType::DIV: return EmitBinaryOperation('/');
                     case NodeType::MUL: return EmitBinaryOperation('*');
@@ -242,7 +298,7 @@ namespace GVSL {
                 return "";
             };
 
-            outputStream << TurnToString();
+            outputStream << TurnToString() << '\n';
         }
 
     public:
@@ -252,10 +308,18 @@ namespace GVSL {
             outputStream.str("");
             flattenedNodes.clear();
             currentGraph = graph;
+            success = true;
 
-            for (const auto& pair : currentGraph.nodes) flattenedNodes.push_back(FlattenNode(pair.second));
+            PopulatePins();
+            if (!success) return;
+
+            for (NodeID id : evaluationOrder) flattenedNodes.push_back(FlattenNode(currentGraph.nodes[id]));
             for (FlattenedNode& node : flattenedNodes) EmitIR(node);
         };
+
+        [[nodiscard]] std::string GetOutput() const { return outputStream.str(); }
+        [[nodiscard]] const std::string& GetError() const { return errorMessage; }
+        [[nodiscard]] bool Succeeded() const { return success; }
     };
 }
 
