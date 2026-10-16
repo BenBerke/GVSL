@@ -87,7 +87,7 @@ namespace GVSL {
             if (!lhs.IsValid() || !rhs.IsValid()) return Value::Invalid();
 
             return Value{
-                std::visit([](auto a, auto b) -> Storage {
+                std::visit([](const auto& a, auto b) -> Storage {
                     using T1 = std::decay_t<decltype(a)>;
                     using T2 = std::decay_t<decltype(b)>;
 
@@ -139,7 +139,7 @@ namespace GVSL {
                     using T2 = std::decay_t<decltype(b)>;
 
                     if constexpr (std::is_arithmetic_v<T1> && std::is_arithmetic_v<T2>) {
-                        // Optional: Handle division by zero here
+                        // Optional: Handle division by zero here too (compiler already does it)
                         return a / b;
                     } else return std::monostate{};
 
@@ -171,7 +171,7 @@ namespace GVSL {
     struct Pin {
         PinID id = INVALID_ID;
         NodeID nodeID = INVALID_ID; // Denormalization but will offer speed-boost
-        PinSourceType type; // if type == REFERENCE, the value refers to a user variable, not a string literal
+        PinSourceType sourceType; // if type == REFERENCE, the value refers to a user variable, not a string literal
 
         std::vector<PinID> nextPinIDs;
 
@@ -210,6 +210,9 @@ namespace GVSL {
 
         std::unordered_map<std::string, Value> variables;
 
+        NodeID nextNodeID = 0;
+        PinID nextPinID = 0;
+
         // first -> second
         void ConnectPin(const PinID first, const PinID second) { pins[first].nextPinIDs.push_back(second); }
 
@@ -218,6 +221,62 @@ namespace GVSL {
             if (it != variables.end()) return it->second;
 
             return Value::Invalid();
+        }
+
+        bool CreateVariable(const std::string &varName, const Value &value) {
+            auto it = variables.find(varName);
+            if (it != variables.end()) return false; // Variable with same name exists
+
+            variables[varName] = value;
+            return true;
+        }
+
+        // Create and register a new node
+        Node& CreateNode(const NodeType type) {
+            const NodeID id = nextNodeID++;
+
+            Node& node = nodes[id];
+            node.id = id;
+            node.type = type;
+
+            return node;
+        }
+
+        // Create and register a new pin
+        Pin& CreatePin(const PinDirection direction, const NodeID ownerNodeID) {
+            const PinID id = nextPinID++;
+
+            Pin& pin = pins[id];
+            pin.id = id;
+            pin.nodeID = ownerNodeID;
+            pin.direction = direction;
+
+            // Automatically link this pin to its parent node's pin lists
+            Node& ownerNode = nodes[ownerNodeID];
+            if (direction == PinDirection::INPUT) ownerNode.inputPinIDs.push_back(id);
+            else ownerNode.outputPinIDs.push_back(id);
+
+            return pin;
+        }
+
+        Node* GetNode(const NodeID id) {
+            auto it = nodes.find(id);
+            return (it != nodes.end()) ? &it->second : nullptr;
+        }
+
+        [[nodiscard]] const Node* GetNode(NodeID id) const {
+            auto it = nodes.find(id);
+            return (it != nodes.end()) ? &it->second : nullptr;
+        }
+
+        Pin* GetPin(PinID id) {
+            auto it = pins.find(id);
+            return (it != pins.end()) ? &it->second : nullptr;
+        }
+
+        [[nodiscard]] const Pin* GetPin(PinID id) const {
+            auto it = pins.find(id);
+            return (it != pins.end()) ? &it->second : nullptr;
         }
     };
 
@@ -240,8 +299,8 @@ namespace GVSL {
 
             if (v.IsValid()) return v;
 
-            CreateError("Undeclared variable name");
-            return Value{};
+            CreateError(std::format("Undeclared variable name: {}", varName));
+            return Value::Invalid();
         }
 
         void CreateError(const std::string_view error) {
@@ -251,70 +310,89 @@ namespace GVSL {
 
         // Compute one node's outputs from its inputs and push them to connected pins
         bool EvaluateNode(const Node &node) {
-            std::vector<Value> inputValues(node.inputPinIDs.size());
-            for (size_t i = 0; i < node.inputPinIDs.size(); i++)
-                inputValues[i] = currentGraph.pins[node.inputPinIDs[i]].value;
-
             std::vector<Value> outputValues(node.outputPinIDs.size());
+            std::vector<Value> calculatedInputValues(node.inputPinIDs.size());
 
-            auto IsMathOperationNode = [&]() -> bool {
-                return node.CheckPinCounts(2, 1) && IsNumber(inputValues[0].data) && IsNumber(inputValues[1].data);
-            };
+            for (size_t i = 0; i < node.inputPinIDs.size(); i++) {
+                Pin* p = currentGraph.GetPin(node.inputPinIDs[i]);
 
-            switch (node.type) {
-                case NodeType::ADD:
-                case NodeType::SUB:
-                case NodeType::MUL:
-                case NodeType::DIV: {
-                    // Check the pin counts first so we never index past the end of inputValues
-                    if (!node.CheckPinCounts(2, 1)) {
-                        CreateError("Invalid Pin Count in math Node");
-                        return false;
-                    }
-                    if (!IsMathOperationNode()) {
-                        CreateError("Non-number input in math Node");
-                        return false;
-                    }
-
-                    const Value &a = inputValues[0];
-                    const Value &b = inputValues[1];
-
-                    // Integer division by zero is undefined behaviour, floats just give inf
-                    if (node.type == NodeType::DIV && IsType<int>(b.data) && std::get<int>(b.data) == 0) {
-                        CreateError("Integer division by zero");
-                        return false;
-                    }
-
-                    switch (node.type) {
-                        case NodeType::ADD: outputValues[0] = a + b;
-                            break;
-                        case NodeType::SUB: outputValues[0] = a - b;
-                            break;
-                        case NodeType::MUL: outputValues[0] = a * b;
-                            break;
-                        default: outputValues[0] = a / b;
-                            break;
-                    }
-                    break;
+                if (p == nullptr) {
+                    CreateError("Evaluation failed: Invalid pin ID encountered.");
+                    return false;
                 }
 
-                case NodeType::FUNC_START: break; // Entry point, nothing to compute
-
-                case NodeType::CUSTOM: CreateError("CUSTOM nodes are not implemented yet");
-                    return false;
-                case NodeType::UNKNOWN:
-                default: CreateError("Unknown Node Type");
-                    return false;
+                if (p->sourceType == PinSourceType::LITERAL) calculatedInputValues[i] = p->value;
+                else if (p->sourceType == PinSourceType::REFERENCE) {
+                    calculatedInputValues[i] = GetVariableValueSafe(p->value.ToString());
+                    if (!calculatedInputValues[i].IsValid()) return false;
+                    // error already set
+                }
             }
 
-            // Store the results on the output pins, then forward them to every connected input pin
-            for (size_t i = 0; i < node.outputPinIDs.size(); i++) {
-                Pin &outputPin = currentGraph.pins[node.outputPinIDs[i]];
-                outputPin.value = outputValues[i];
-                for (PinID p: outputPin.nextPinIDs) currentGraph.pins[p].value = outputPin.value;
-            }
+                auto IsMathOperationNode = [&]() -> bool {
+                    return node.CheckPinCounts(2, 1) && IsNumber(calculatedInputValues[0].data) && IsNumber(calculatedInputValues[1].data);
+                };
 
-            return true;
+                switch (node.type) {
+                    case NodeType::ADD:
+                    case NodeType::SUB:
+                    case NodeType::MUL:
+                    case NodeType::DIV: {
+                        // Check the pin counts first so we never index past the end of inputValues
+                        if (!node.CheckPinCounts(2, 1)) {
+                            CreateError("Invalid Pin Count in math Node");
+                            return false;
+                        }
+                        if (!IsMathOperationNode()) {
+                            CreateError("Non-number input in math Node");
+                            return false;
+                        }
+
+                        const Value &a = calculatedInputValues[0];
+                        const Value &b = calculatedInputValues[1];
+
+                        // Integer division by zero is undefined behaviour, floats just give inf
+                        if (node.type == NodeType::DIV && IsType<int>(b.data) && std::get<int>(b.data) == 0) {
+                            CreateError("Integer division by zero");
+                            return false;
+                        }
+
+                        switch (node.type) {
+                            case NodeType::ADD: outputValues[0] = a + b; break;
+                            case NodeType::SUB: outputValues[0] = a - b; break;
+                            case NodeType::MUL: outputValues[0] = a * b; break;
+                            case NodeType::DIV: outputValues[0] = a / b; break;
+                            default: break;
+                        }
+                        break;
+                    }
+
+                    case NodeType::FUNC_START: break; // Entry point, nothing to compute
+
+                    case NodeType::CUSTOM: CreateError("CUSTOM nodes are not implemented yet");
+                        return false;
+                    case NodeType::UNKNOWN:
+                    default: CreateError("Unknown Node Type");
+                        return false;
+                }
+
+                // Store the results on the output pins, then forward them to every connected input pin
+                for (size_t i = 0; i < node.outputPinIDs.size(); i++) {
+                    Pin* outputPin = currentGraph.GetPin(node.outputPinIDs[i]);
+                    if (outputPin == nullptr) continue;
+
+                    outputPin->value = outputValues[i];
+
+                    for (const PinID pID : outputPin->nextPinIDs) {
+                        Pin* targetPin = currentGraph.GetPin(pID);
+                        if (targetPin == nullptr) continue;
+
+                        targetPin->value = outputPin->value;
+                        targetPin->sourceType = PinSourceType::LITERAL;
+                    }
+                }
+
+                return true;
         }
 
         // Go through every single node, calculate the output pins and populate the following node's inputs
@@ -338,19 +416,13 @@ namespace GVSL {
                 }
                 s = State::VISITING;
 
-                const auto nodeIt = currentGraph.nodes.find(id);
-                if (nodeIt == currentGraph.nodes.end()) {
-                    CreateError("Pin refers to missing Node");
-                    return false;
-                }
-
-                const Node &node = nodeIt->second;
+                const Node* node = currentGraph.GetNode(id);
 
                 // Evaluate everything feeding this node first
-                for (PinID in: node.inputPinIDs)
+                for (PinID in: node->inputPinIDs)
                     if (auto it = sourceOf.find(in); it != sourceOf.end() && !Visit(it->second)) return false;
 
-                if (!EvaluateNode(node)) return false;
+                if (!EvaluateNode(*node)) return false;
 
                 s = State::DONE;
                 evaluationOrder.push_back(id);
@@ -418,7 +490,7 @@ namespace GVSL {
         };
 
         [[nodiscard]] std::string GetOutput() const { return outputStream.str(); }
-        [[nodiscard]] const std::string &GetError() const { return errorMessage; }
+        [[nodiscard]] const std::string& GetError() const { return errorMessage; }
         [[nodiscard]] bool Succeeded() const { return success; }
     };
 }
