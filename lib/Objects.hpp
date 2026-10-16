@@ -47,6 +47,7 @@ namespace GVSL {
     // -------
     // Pins
     // -------
+    // A pin is an input / output field of a Node
 
     using PinID = NodeID;
 
@@ -55,6 +56,7 @@ namespace GVSL {
         OUTPUT = false,
     };
 
+    // Reference means Value is a string of a variable name. Literal is a literal value like 5.0
     enum class PinSourceType : uint8_t {
         LITERAL,
         REFERENCE
@@ -63,7 +65,7 @@ namespace GVSL {
     // Variable types supported
     using Storage = std::variant<int, float, bool, double, std::monostate, std::string>;
 
-    // Saves having to write unreadable, long lines every time we want to check a type of a pin
+    // Check which type of value the pin holds (int, float, string etc.)
     template<typename T, typename... Types>
     constexpr bool IsType(const std::variant<Types...> &v) noexcept { return std::holds_alternative<T>(v); }
 
@@ -80,10 +82,11 @@ namespace GVSL {
     // Structs and Classes
     //=======================================
 
+    // The value a pin holds
     struct Value {
-        Storage data;
+        Storage data; // Can be an int, a float, a double etc.
 
-        // I hate this but I don't know what to replace it with
+        // Operator overloading to support pin.value + pin.value
         friend Value operator+(const Value &lhs, const Value &rhs) {
             if (!lhs.IsValid() || !rhs.IsValid()) return Value::Invalid();
 
@@ -174,7 +177,7 @@ namespace GVSL {
         NodeID nodeID = INVALID_ID; // Denormalization but will offer speed-boost
         PinSourceType sourceType; // if type == REFERENCE, the value refers to a user variable, not a string literal
 
-        std::vector<PinID> nextPinIDs;
+        std::vector<PinID> nextPinIDs; // If this is an output pin, this is a list of every single input pins it connects to
 
         PinDirection direction = PinDirection::INPUT;
 
@@ -199,12 +202,14 @@ namespace GVSL {
         }
     };
 
+    // Stripped version of a Node that only contains the necessary information to emit an IR
     struct FlattenedNode {
         NodeType type = NodeType::UNKNOWN;
 
         std::vector<Value> inputValues;
     };
 
+    // Manages pins and nodes
     struct Graph {
         std::unordered_map<NodeID, Node> nodes;
         std::unordered_map<PinID, Pin> pins;
@@ -284,7 +289,7 @@ namespace GVSL {
     class Compiler {
         std::stringstream outputStream; // Compiled IR
 
-        std::string outputMessage;
+        std::string outputMessage; // For warnings, errors, succeses etc.
         std::string errorMessage;
 
         bool success = true;
@@ -337,9 +342,10 @@ namespace GVSL {
                 }
             }
 
+            // Ensure the node has 2 input pins, 1 output pin and input pins hold a number value
             auto IsMathOperationNode = [&]() -> bool {
-                return node.CheckPinCounts(2, 1) && IsNumber(calculatedInputValues[0].data) && IsNumber(
-                           calculatedInputValues[1].data);
+                return node.CheckPinCounts(2, 1) && IsNumber(calculatedInputValues[0].data) &&
+                    IsNumber(calculatedInputValues[1].data);
             };
 
             switch (node.type) {
@@ -366,6 +372,7 @@ namespace GVSL {
                         return false;
                     }
 
+                    // Calculate the output value of the node
                     switch (node.type) {
                         case NodeType::ADD: outputValues[0] = a + b; break;
                         case NodeType::SUB: outputValues[0] = a - b; break;
@@ -404,13 +411,13 @@ namespace GVSL {
             return true;
         }
 
+        // Create an unordered_map that stores which output pins are connected to which input pins
         void BuildSourceMap() {
             sourceOf.clear();
-            for (const auto &pin: currentGraph.pins | std::views::values)
-                for (PinID next: pin.nextPinIDs) sourceOf[next] = pin.nodeID;
+            for (const auto &pin: currentGraph.pins | std::views::values) for (PinID next: pin.nextPinIDs) sourceOf[next] = pin.nodeID;
         }
 
-        // Follow every FUNC_DEC's nextNodeID chain, one line per function
+        // Follow every FUNC_DEC node's nextNodeID chain, one line per function
         bool CollectFunctionLines(std::vector<std::vector<NodeID>> &functionLines) {
             execNodes.clear();
 
@@ -420,6 +427,7 @@ namespace GVSL {
                 std::vector<NodeID> currentLine;
                 std::unordered_set<NodeID> seen;
 
+                // Create a vector of nodes starting from this FUNC_DEC node
                 const Node* currentlyVisiting = currentGraph.GetNode(val.nextNodeID);
                 while (currentlyVisiting != nullptr) {
                     if (!seen.insert(currentlyVisiting->id).second) {
@@ -496,6 +504,7 @@ namespace GVSL {
         void EmitIR(const FlattenedNode &node) {
             // Example (TEMPORARY)
 
+            // returns a string such as "a + b" where 'a' and 'b' are Node's inputs
             auto EmitBinaryOperation = [node](const char op) -> std::string {
                 auto first = node.inputValues[0].ToString();
                 auto second = node.inputValues[1].ToString();
@@ -525,6 +534,7 @@ namespace GVSL {
 
     public:
         void Compile(const Graph &graph) {
+            // Reset compile to default state
             errorMessage.clear();
             outputMessage.clear();
             outputStream.str("");
@@ -532,8 +542,10 @@ namespace GVSL {
             currentGraph = graph;
             success = true;
 
+            // Connect each output pin to an input pin for evaluation
             BuildSourceMap();
 
+            // Look at every single function declaration and create a vector for each chain of nodes starting from the function declaration
             std::vector<std::vector<NodeID>> functionLines;
             if (!CollectFunctionLines(functionLines)) return;
 
