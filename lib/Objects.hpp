@@ -54,8 +54,12 @@ namespace GVSL {
         OUTPUT = false,
     };
 
-    // Add more in the future.
-    using Storage = std::variant<int, float, bool, double>;
+    enum class PinSourceType : uint8_t {
+        LITERAL,
+        REFERENCE
+    };
+    // Variable types supported
+    using Storage = std::variant<int, float, bool, double, std::monostate, std::string>;
 
     // Saves having to write unreadable, long lines every time we want to check a type of a pin
     template <typename T, typename... Types>
@@ -107,11 +111,22 @@ namespace GVSL {
                 return std::format("{}", arg);
             }, data);
         }
+
+        // Helper checks
+        [[nodiscard]] bool IsValid() const {
+            // It's valid if it is NOT std::monostate
+            return !std::holds_alternative<std::monostate>(data);
+        }
+
+        static Value Invalid() {
+            return Value {std::monostate{}};
+        }
     };
 
     struct Pin {
         PinID id = INVALID_ID;
         NodeID nodeID = INVALID_ID; // Denormalization but will offer speed-boost
+        PinSourceType type;
 
         std::vector<PinID> nextPinIDs;
 
@@ -148,8 +163,16 @@ namespace GVSL {
         std::unordered_map<NodeID, Node> nodes;
         std::unordered_map<PinID, Pin> pins;
 
+        std::unordered_map<std::string, Value> variables;
+
         // first -> second
         void ConnectPin(const PinID first, const PinID second) { pins[first].nextPinIDs.push_back(second);}
+        Value GetVariableValue(const std::string& varName) {
+            auto it = variables.find(varName);
+            if (it != variables.end()) return it->second;
+
+            return Value::Invalid();
+        }
     };
 
     class Compiler {
@@ -165,6 +188,15 @@ namespace GVSL {
         Graph currentGraph;
 
         std::vector<NodeID> evaluationOrder; // nodes in the order they were evaluated
+
+        Value GetVariableValueSafe(const std::string& varName) {
+            Value v = currentGraph.GetVariableValue(varName);
+
+            if (v.IsValid()) return v;
+
+            CreateError("Undeclared variable name");
+            return Value{};
+        }
 
         void CreateError(const std::string_view error) {
             success = false;
@@ -189,7 +221,7 @@ namespace GVSL {
                 case NodeType::DIV: {
                     // Check the pin counts first so we never index past the end of inputValues
                     if (!node.CheckPinCounts(2, 1)) { CreateError("Invalid Pin Count in math Node"); return false; }
-                    if (!IsMathOperationNode())     { CreateError("Non-number input in math Node");  return false; }
+                    if (!IsMathOperationNode()) { CreateError("Non-number input in math Node");  return false; }
 
                     const Value& a = inputValues[0];
                     const Value& b = inputValues[1];

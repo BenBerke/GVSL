@@ -11,3 +11,8 @@ option(GVSL_BUILD_SANDBOX "Build the SDL3 + imgui-node-editor test app" ${PROJEC
 if(GVSL_BUILD_SANDBOX)
     add_subdirectory(sandbox)
 endif()
+
+# Console example: basic addition / multiplication through GVSL (no SDL/imgui needed)
+add_executable(GVSL_MathExample sandbox/math_main.cpp)
+target_link_libraries(GVSL_MathExample PRIVATE GVSL)
+set_target_properties(GVSL PROPERTIES LINKER_LANGUAGE CXX)
