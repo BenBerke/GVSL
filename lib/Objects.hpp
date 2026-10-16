@@ -107,8 +107,12 @@ namespace GVSL {
         }
 
         [[nodiscard]] std::string ToString() const {
-            return std::visit([](auto&& arg) {
-                return std::format("{}", arg);
+            return std::visit([]<typename T0>(T0&& arg) -> std::string {
+                using T = std::decay_t<T0>;
+
+                if constexpr (std::is_same_v<T, std::monostate>) return "null";
+                else if constexpr (std::is_same_v<T, bool>) return arg ? "true" : "false";
+                else return std::format("{}", arg);
             }, data);
         }
 
