@@ -126,7 +126,7 @@ namespace GVSL {
     struct Pin {
         PinID id = INVALID_ID;
         NodeID nodeID = INVALID_ID; // Denormalization but will offer speed-boost
-        PinSourceType type;
+        PinSourceType type; // if type == REFERENCE, the value refers to a user variable, not a string literal
 
         std::vector<PinID> nextPinIDs;
 
