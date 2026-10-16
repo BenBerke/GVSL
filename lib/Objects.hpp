@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -37,7 +38,7 @@ namespace GVSL {
         MUL,
         DIV,
 
-        FUNC_START,
+        FUNC_DEC,
 
         TYPE_COUNT,
         UNKNOWN = TYPE_COUNT,
@@ -292,18 +293,25 @@ namespace GVSL {
 
         Graph currentGraph;
 
-        std::vector<NodeID> evaluationOrder; // nodes in the order they were evaluated
+        // Which node feeds each input pin, built once per compile
+        std::unordered_map<PinID, NodeID> sourceOf;
+
+        // Every node that sits on a function's exec chain
+        std::unordered_set<NodeID> execNodes;
+
+        enum class State { UNVISITED, VISITING, DONE };
+        std::unordered_map<NodeID, State> state;
 
         Value GetVariableValueSafe(const std::string &varName) {
             Value v = currentGraph.GetVariableValue(varName);
 
             if (v.IsValid()) return v;
 
-            CreateError(std::format("Undeclared variable name: {}", varName));
+            RaiseError(std::format("Undeclared variable name: {}", varName));
             return Value::Invalid();
         }
 
-        void CreateError(const std::string_view error) {
+        void RaiseError(const std::string_view error) {
             success = false;
             errorMessage = error;
         }
@@ -317,7 +325,7 @@ namespace GVSL {
                 Pin* p = currentGraph.GetPin(node.inputPinIDs[i]);
 
                 if (p == nullptr) {
-                    CreateError("Evaluation failed: Invalid pin ID encountered.");
+                    RaiseError("Evaluation failed: Invalid pin ID encountered.");
                     return false;
                 }
 
@@ -329,107 +337,147 @@ namespace GVSL {
                 }
             }
 
-                auto IsMathOperationNode = [&]() -> bool {
-                    return node.CheckPinCounts(2, 1) && IsNumber(calculatedInputValues[0].data) && IsNumber(calculatedInputValues[1].data);
-                };
-
-                switch (node.type) {
-                    case NodeType::ADD:
-                    case NodeType::SUB:
-                    case NodeType::MUL:
-                    case NodeType::DIV: {
-                        // Check the pin counts first so we never index past the end of inputValues
-                        if (!node.CheckPinCounts(2, 1)) {
-                            CreateError("Invalid Pin Count in math Node");
-                            return false;
-                        }
-                        if (!IsMathOperationNode()) {
-                            CreateError("Non-number input in math Node");
-                            return false;
-                        }
-
-                        const Value &a = calculatedInputValues[0];
-                        const Value &b = calculatedInputValues[1];
-
-                        // Integer division by zero is undefined behaviour, floats just give inf
-                        if (node.type == NodeType::DIV && IsType<int>(b.data) && std::get<int>(b.data) == 0) {
-                            CreateError("Integer division by zero");
-                            return false;
-                        }
-
-                        switch (node.type) {
-                            case NodeType::ADD: outputValues[0] = a + b; break;
-                            case NodeType::SUB: outputValues[0] = a - b; break;
-                            case NodeType::MUL: outputValues[0] = a * b; break;
-                            case NodeType::DIV: outputValues[0] = a / b; break;
-                            default: break;
-                        }
-                        break;
-                    }
-
-                    case NodeType::FUNC_START: break; // Entry point, nothing to compute
-
-                    case NodeType::CUSTOM: CreateError("CUSTOM nodes are not implemented yet");
-                        return false;
-                    case NodeType::UNKNOWN:
-                    default: CreateError("Unknown Node Type");
-                        return false;
-                }
-
-                // Store the results on the output pins, then forward them to every connected input pin
-                for (size_t i = 0; i < node.outputPinIDs.size(); i++) {
-                    Pin* outputPin = currentGraph.GetPin(node.outputPinIDs[i]);
-                    if (outputPin == nullptr) continue;
-
-                    outputPin->value = outputValues[i];
-
-                    for (const PinID pID : outputPin->nextPinIDs) {
-                        Pin* targetPin = currentGraph.GetPin(pID);
-                        if (targetPin == nullptr) continue;
-
-                        targetPin->value = outputPin->value;
-                        targetPin->sourceType = PinSourceType::LITERAL;
-                    }
-                }
-
-                return true;
-        }
-
-        // Go through every single node, calculate the output pins and populate the following node's inputs
-        void PopulatePins() {
-            evaluationOrder.clear();
-
-            // Which nodes feed which inputs
-            std::unordered_map<PinID, NodeID> sourceOf;
-            for (const auto &pin: currentGraph.pins | std::views::values)
-                for (PinID next: pin.nextPinIDs) sourceOf[next] = pin.nodeID;
-
-            enum class State { UNVISITED, VISITING, DONE };
-            std::unordered_map<NodeID, State> state;
-
-            std::function<bool(NodeID)> Visit = [&](const NodeID id) -> bool {
-                State &s = state[id];
-                if (s == State::DONE) return true;
-                if (s == State::VISITING) {
-                    CreateError("Cycle detected in graph");
-                    return false;
-                }
-                s = State::VISITING;
-
-                const Node* node = currentGraph.GetNode(id);
-
-                // Evaluate everything feeding this node first
-                for (PinID in: node->inputPinIDs)
-                    if (auto it = sourceOf.find(in); it != sourceOf.end() && !Visit(it->second)) return false;
-
-                if (!EvaluateNode(*node)) return false;
-
-                s = State::DONE;
-                evaluationOrder.push_back(id);
-                return true;
+            auto IsMathOperationNode = [&]() -> bool {
+                return node.CheckPinCounts(2, 1) && IsNumber(calculatedInputValues[0].data) && IsNumber(
+                           calculatedInputValues[1].data);
             };
 
-            for (const auto &id: currentGraph.nodes | std::views::keys) if (!Visit(id)) return;
+            switch (node.type) {
+                case NodeType::ADD:
+                case NodeType::SUB:
+                case NodeType::MUL:
+                case NodeType::DIV: {
+                    // Check the pin counts first so we never index past the end of inputValues
+                    if (!node.CheckPinCounts(2, 1)) {
+                        RaiseError("Invalid Pin Count in math Node");
+                        return false;
+                    }
+                    if (!IsMathOperationNode()) {
+                        RaiseError("Non-number input in math Node");
+                        return false;
+                    }
+
+                    const Value &a = calculatedInputValues[0];
+                    const Value &b = calculatedInputValues[1];
+
+                    // Integer division by zero is undefined behaviour, floats just give inf
+                    if (node.type == NodeType::DIV && IsType<int>(b.data) && std::get<int>(b.data) == 0) {
+                        RaiseError("Integer division by zero");
+                        return false;
+                    }
+
+                    switch (node.type) {
+                        case NodeType::ADD: outputValues[0] = a + b; break;
+                        case NodeType::SUB: outputValues[0] = a - b; break;
+                        case NodeType::MUL: outputValues[0] = a * b; break;
+                        case NodeType::DIV: outputValues[0] = a / b; break;
+                        default: break;
+                    }
+                    break;
+                }
+
+                case NodeType::FUNC_DEC: break; // Entry point, nothing to compute
+
+                case NodeType::CUSTOM: RaiseError("CUSTOM nodes are not implemented yet");
+                    return false;
+                case NodeType::UNKNOWN:
+                default: RaiseError("Unknown Node Type");
+                    return false;
+            }
+
+            // Store the results on the output pins, then forward them to every connected input pin
+            for (size_t i = 0; i < node.outputPinIDs.size(); i++) {
+                Pin *outputPin = currentGraph.GetPin(node.outputPinIDs[i]);
+                if (outputPin == nullptr) continue;
+
+                outputPin->value = outputValues[i];
+
+                for (const PinID pID: outputPin->nextPinIDs) {
+                    Pin *targetPin = currentGraph.GetPin(pID);
+                    if (targetPin == nullptr) continue;
+
+                    targetPin->value = outputPin->value;
+                    targetPin->sourceType = PinSourceType::LITERAL;
+                }
+            }
+
+            return true;
+        }
+
+        void BuildSourceMap() {
+            sourceOf.clear();
+            for (const auto &pin: currentGraph.pins | std::views::values)
+                for (PinID next: pin.nextPinIDs) sourceOf[next] = pin.nodeID;
+        }
+
+        // Follow every FUNC_DEC's nextNodeID chain, one line per function
+        bool CollectFunctionLines(std::vector<std::vector<NodeID>> &functionLines) {
+            execNodes.clear();
+
+            for (const Node &val: currentGraph.nodes | std::views::values) {
+                if (val.type != NodeType::FUNC_DEC) continue;
+
+                std::vector<NodeID> currentLine;
+                std::unordered_set<NodeID> seen;
+
+                const Node* currentlyVisiting = currentGraph.GetNode(val.nextNodeID);
+                while (currentlyVisiting != nullptr) {
+                    if (!seen.insert(currentlyVisiting->id).second) {
+                        RaiseError("Cycle detected in function exec chain");
+                        return false;
+                    }
+
+                    currentLine.push_back(currentlyVisiting->id);
+                    execNodes.insert(currentlyVisiting->id);
+                    currentlyVisiting = currentGraph.GetNode(currentlyVisiting->nextNodeID);
+                }
+
+                functionLines.push_back(currentLine);
+            }
+
+            return true;
+        }
+
+        // Evaluate a node after everything feeding it, appending to order
+        bool Visit(const NodeID id, std::vector<NodeID> &order) {
+            State &s = state[id];
+            if (s == State::DONE) return true;
+            if (s == State::VISITING) {
+                RaiseError("Cycle detected in graph");
+                return false;
+            }
+            s = State::VISITING;
+
+            const Node* node = currentGraph.GetNode(id);
+            if (node == nullptr) {
+                RaiseError("Evaluation failed: Invalid node ID encountered.");
+                return false;
+            }
+
+            // Evaluate everything feeding this node first, only pure nodes may be pulled in out of exec order
+            for (PinID in: node->inputPinIDs) {
+                auto it = sourceOf.find(in);
+                if (it == sourceOf.end()) continue;
+
+                if (execNodes.contains(it->second) && state[it->second] != State::DONE) {
+                    RaiseError("Value used before its node is executed");
+                    return false;
+                }
+                if (!Visit(it->second, order)) return false;
+            }
+
+            if (!EvaluateNode(*node)) return false;
+
+            state[id] = State::DONE; // Re-lookup, the recursion may have rehashed the map
+            order.push_back(id);
+            return true;
+        }
+
+        // Walk one function's exec chain, pulling each node's data inputs first
+        bool EvaluateLine(const std::vector<NodeID> &line, std::vector<NodeID> &order) {
+            state.clear(); // Pure nodes get re-evaluated per function
+            for (NodeID id: line) if (!Visit(id, order)) return false;
+            return true;
         }
 
         // Take a node, strip away the unnecessary information and emit a flattened version for the IR
@@ -462,8 +510,10 @@ namespace GVSL {
                     case NodeType::DIV: return EmitBinaryOperation('/');
                     case NodeType::MUL: return EmitBinaryOperation('*');
 
+                    case NodeType::FUNC_DEC: return ""; // todo RETURN FUNCTION DEC,
+
                     case NodeType::UNKNOWN:
-                    default: CreateError("Unknown NodeType while emitting IR");
+                    default: RaiseError("Unknown NodeType while emitting IR");
                         break;
                 }
 
@@ -474,7 +524,7 @@ namespace GVSL {
         }
 
     public:
-        void Compile(const Graph &graph, NodeID startingNodeID) {
+        void Compile(const Graph &graph) {
             errorMessage.clear();
             outputMessage.clear();
             outputStream.str("");
@@ -482,10 +532,18 @@ namespace GVSL {
             currentGraph = graph;
             success = true;
 
-            PopulatePins();
-            if (!success) return;
+            BuildSourceMap();
 
-            for (NodeID id: evaluationOrder) flattenedNodes.push_back(FlattenNode(currentGraph.nodes[id]));
+            std::vector<std::vector<NodeID>> functionLines;
+            if (!CollectFunctionLines(functionLines)) return;
+
+            for (const std::vector<NodeID> &line: functionLines) {
+                std::vector<NodeID> order;
+                if (!EvaluateLine(line, order)) return;
+
+                for (NodeID id: order) flattenedNodes.push_back(FlattenNode(currentGraph.nodes[id]));
+            }
+
             for (FlattenedNode &node: flattenedNodes) EmitIR(node);
         };
 
