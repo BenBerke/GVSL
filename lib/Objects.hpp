@@ -39,6 +39,7 @@ namespace GVSL {
         DIV,
 
         FUNC_DEC,
+        FUNC_END,
 
         TYPE_COUNT,
         UNKNOWN = TYPE_COUNT,
@@ -184,10 +185,20 @@ namespace GVSL {
         Value value;
     };
 
+    struct FunctionDecData {
+        std::string name;
+        uint8_t parameterCount;
+        std::vector<Value> parameters;
+    };
+
+    using Payload = std::variant<FunctionDecData>;
+
     // A node should only hold the logics, a "Menu Node" should be created to hold the position and other visual things
     struct Node {
         NodeID id = INVALID_ID;
         NodeType type = NodeType::UNKNOWN;
+
+        Payload payload;
 
         // Nodes only need to record the next node because they will only be used to turn into an IR, not get executed
         NodeID nextNodeID = INVALID_ID;
@@ -207,6 +218,8 @@ namespace GVSL {
         NodeType type = NodeType::UNKNOWN;
 
         std::vector<Value> inputValues;
+
+        std::optional<Payload> payload;
     };
 
     // Manages pins and nodes
@@ -384,6 +397,7 @@ namespace GVSL {
                 }
 
                 case NodeType::FUNC_DEC: break; // Entry point, nothing to compute
+                case NodeType::FUNC_END: break;
 
                 case NodeType::CUSTOM: RaiseError("CUSTOM nodes are not implemented yet");
                     return false;
@@ -421,14 +435,20 @@ namespace GVSL {
         bool CollectFunctionLines(std::vector<std::vector<NodeID>> &functionLines) {
             execNodes.clear();
 
-            for (const Node &val: currentGraph.nodes | std::views::values) {
-                if (val.type != NodeType::FUNC_DEC) continue;
+            // Collect the ids first, creating FUNC_END nodes below can rehash the map we would be iterating
+            std::vector<NodeID> funcDecIDs;
+            for (const Node &val: currentGraph.nodes | std::views::values)
+                if (val.type == NodeType::FUNC_DEC) funcDecIDs.push_back(val.id);
+
+            for (const NodeID funcDecID: funcDecIDs) {
+                const Node &val = currentGraph.nodes[funcDecID];
 
                 std::vector<NodeID> currentLine;
                 std::unordered_set<NodeID> seen;
 
                 // Create a vector of nodes starting from this FUNC_DEC node
                 const Node* currentlyVisiting = currentGraph.GetNode(val.nextNodeID);
+                currentLine.push_back(val.id);
                 while (currentlyVisiting != nullptr) {
                     if (!seen.insert(currentlyVisiting->id).second) {
                         RaiseError("Cycle detected in function exec chain");
@@ -440,6 +460,8 @@ namespace GVSL {
                     currentlyVisiting = currentGraph.GetNode(currentlyVisiting->nextNodeID);
                 }
 
+                Node& n = currentGraph.CreateNode(NodeType::FUNC_END);
+                currentLine.push_back(n.id);
                 functionLines.push_back(currentLine);
             }
 
@@ -498,7 +520,17 @@ namespace GVSL {
             for (size_t i = 0; i < node.inputPinIDs.size(); i++)
                 output.inputValues[i] = currentGraph.pins[node.inputPinIDs[i]].value;
 
+            output.payload = node.payload;
+
             return output;
+        }
+
+        std::string EmitFunctionIR(const FlattenedNode& node) {
+            const auto funcData = std::get<FunctionDecData>(node.payload.value());
+
+            std::string funcName = funcData.name;
+
+            return std::format("void {}({})", funcName, funcData.parameterCount);
         }
 
         void EmitIR(const FlattenedNode &node) {
@@ -519,7 +551,8 @@ namespace GVSL {
                     case NodeType::DIV: return EmitBinaryOperation('/');
                     case NodeType::MUL: return EmitBinaryOperation('*');
 
-                    case NodeType::FUNC_DEC: return ""; // todo RETURN FUNCTION DEC,
+                    case NodeType::FUNC_DEC: return EmitFunctionIR(node);; // todo RETURN FUNCTION DEC,
+                    case NodeType::FUNC_END: return "}";
 
                     case NodeType::UNKNOWN:
                     default: RaiseError("Unknown NodeType while emitting IR");
