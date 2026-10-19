@@ -185,12 +185,15 @@ namespace GVSL {
         Value value;
     };
 
+    // Payload struct
     struct FunctionDecData {
         std::string name;
         uint8_t parameterCount;
         std::vector<Value> parameters;
     };
 
+    // Payload is the extra, type-specific information a node has to carry.
+    // For example, a function declaration node would have to carry a function name and a paremeter count while a for-loop has to carry the loop count etc.
     using Payload = std::variant<FunctionDecData>;
 
     // A node should only hold the logics, a "Menu Node" should be created to hold the position and other visual things
@@ -206,6 +209,7 @@ namespace GVSL {
         std::vector<PinID> inputPinIDs = std::vector<PinID>();
         std::vector<PinID> outputPinIDs = std::vector<PinID>();
 
+        // Returns true if the node has the specified amount of input and output pins, false otherwise
         [[nodiscard]] bool CheckPinCounts(const uint32_t inPinCount, const uint32_t outPinCount) const {
             if (inPinCount != 0 && inputPinIDs.size() != inPinCount) return false;
             if (outPinCount != 0 && outputPinIDs.size() != outPinCount) return false;
@@ -278,22 +282,22 @@ namespace GVSL {
             return pin;
         }
 
-        Node* GetNode(const NodeID id) {
+        [[nodiscard]] Node* GetNode(const NodeID id) {
             auto it = nodes.find(id);
             return (it != nodes.end()) ? &it->second : nullptr;
         }
 
-        [[nodiscard]] const Node* GetNode(NodeID id) const {
+        [[nodiscard]] const Node* GetNode(const NodeID id) const {
             auto it = nodes.find(id);
             return (it != nodes.end()) ? &it->second : nullptr;
         }
 
-        Pin* GetPin(PinID id) {
+        [[nodiscard]] Pin* GetPin(const PinID id) {
             auto it = pins.find(id);
             return (it != pins.end()) ? &it->second : nullptr;
         }
 
-        [[nodiscard]] const Pin* GetPin(PinID id) const {
+        [[nodiscard]] const Pin* GetPin(const PinID id) const {
             auto it = pins.find(id);
             return (it != pins.end()) ? &it->second : nullptr;
         }
@@ -320,6 +324,7 @@ namespace GVSL {
         enum class State { UNVISITED, VISITING, DONE };
         std::unordered_map<NodeID, State> state;
 
+        // Saves having to type graph.GetVariableValue() everytime, also can return an invalid node
         Value GetVariableValueSafe(const std::string &varName) {
             Value v = currentGraph.GetVariableValue(varName);
 
@@ -351,7 +356,7 @@ namespace GVSL {
                 else if (p->sourceType == PinSourceType::REFERENCE) {
                     calculatedInputValues[i] = GetVariableValueSafe(p->value.ToString());
                     if (!calculatedInputValues[i].IsValid()) return false;
-                    // error already set
+                    // error already set, no need to set again
                 }
             }
 
@@ -362,6 +367,7 @@ namespace GVSL {
             };
 
             switch (node.type) {
+                // These binary operators have near identical conditions, so just repeat the same case
                 case NodeType::ADD:
                 case NodeType::SUB:
                 case NodeType::MUL:
@@ -397,13 +403,11 @@ namespace GVSL {
                 }
 
                 case NodeType::FUNC_DEC: break; // Entry point, nothing to compute
-                case NodeType::FUNC_END: break;
+                case NodeType::FUNC_END: break; // End point, nothing to compute
 
-                case NodeType::CUSTOM: RaiseError("CUSTOM nodes are not implemented yet");
-                    return false;
+                case NodeType::CUSTOM: RaiseError("CUSTOM nodes are not implemented yet"); return false;
                 case NodeType::UNKNOWN:
-                default: RaiseError("Unknown Node Type");
-                    return false;
+                default: RaiseError("Unknown Node Type"); return false;
             }
 
             // Store the results on the output pins, then forward them to every connected input pin
@@ -437,9 +441,11 @@ namespace GVSL {
 
             // Collect the ids first, creating FUNC_END nodes below can rehash the map we would be iterating
             std::vector<NodeID> funcDecIDs;
+            // Look at every node and find which ones are function declarations
             for (const Node &val: currentGraph.nodes | std::views::values)
                 if (val.type == NodeType::FUNC_DEC) funcDecIDs.push_back(val.id);
 
+            // Loop through all the function declarations and collect the nodes
             for (const NodeID funcDecID: funcDecIDs) {
                 const Node &val = currentGraph.nodes[funcDecID];
 
@@ -525,6 +531,10 @@ namespace GVSL {
             return output;
         }
 
+        // ============================================
+        //                    IR
+        // ===========================================-
+
         std::string EmitFunctionIR(const FlattenedNode& node) {
             const auto funcData = std::get<FunctionDecData>(node.payload.value());
 
@@ -536,13 +546,14 @@ namespace GVSL {
         void EmitIR(const FlattenedNode &node) {
             // Example (TEMPORARY)
 
-            // returns a string such as "a + b" where 'a' and 'b' are Node's inputs
+            // Helper function, returns a string such as "a + b" where 'a' and 'b' are Node's inputs
             auto EmitBinaryOperation = [node](const char op) -> std::string {
                 auto first = node.inputValues[0].ToString();
                 auto second = node.inputValues[1].ToString();
                 return std::format("{} {} {}", first, op, second);
             };
 
+            // The heart of the IR, turns nodes into string
             auto TurnToString = [node, EmitBinaryOperation, this]() -> std::string {
                 switch (node.type) {
                     case NodeType::ADD: return EmitBinaryOperation('+');
@@ -551,7 +562,7 @@ namespace GVSL {
                     case NodeType::DIV: return EmitBinaryOperation('/');
                     case NodeType::MUL: return EmitBinaryOperation('*');
 
-                    case NodeType::FUNC_DEC: return EmitFunctionIR(node);; // todo RETURN FUNCTION DEC,
+                    case NodeType::FUNC_DEC: return EmitFunctionIR(node);
                     case NodeType::FUNC_END: return "}";
 
                     case NodeType::UNKNOWN:
